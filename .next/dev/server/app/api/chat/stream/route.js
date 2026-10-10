@@ -1,0 +1,11 @@
+var R=require("../../../../chunks/[turbopack]_runtime.js")("server/app/api/chat/stream/route.js")
+R.c("server/chunks/[root-of-the-server]__1gk67-_buc9yg._.js")
+R.c("server/chunks/node_modules_next_1hp0u-43o981a._.js")
+R.c("server/chunks/node_modules_google-auth-library_0hemw2cyy8bv1._.js")
+R.c("server/chunks/node_modules_ws_0nt0_o8ito5vw._.js")
+R.c("server/chunks/node_modules_@google_genai_dist_node_index_mjs_03zuq2l6b-3f6._.js")
+R.c("server/chunks/node_modules_0t__9yu9mlw2e._.js")
+R.c("server/chunks/[root-of-the-server]__16m2-ks9tfacz._.js")
+R.c("server/chunks/_next-internal_server_app_api_chat_stream_route_actions_0papuz1lb7mhg.js")
+R.m("[project]/node_modules/next/dist/esm/build/templates/app-route.js { INNER_APP_ROUTE => \"[project]/src/app/api/chat/stream/route.ts [app-route] (ecmascript)\" } [app-route] (ecmascript)")
+module.exports=R.m("[project]/node_modules/next/dist/esm/build/templates/app-route.js { INNER_APP_ROUTE => \"[project]/src/app/api/chat/stream/route.ts [app-route] (ecmascript)\" } [app-route] (ecmascript)").exports

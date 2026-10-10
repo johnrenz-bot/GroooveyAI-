@@ -1,0 +1,167 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface: #f8f5f0;
+  --color-surface-dim: #dbdad6;
+  --color-surface-bright: #f8f5f0;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #f4f4f0;
+  --color-surface-container: #efeeea;
+  --color-surface-container-high: #e9e8e4;
+  --color-surface-container-highest: #e3e2df;
+  --color-on-surface: #292524;
+  --color-on-surface-variant: #534437;
+  --color-inverse-surface: #2f312e;
+  --color-inverse-on-surface: #f2f1ed;
+  --color-outline: #867465;
+  --color-outline-variant: #d9c3b1;
+  --color-surface-tint: #8c5000;
+  --color-primary: #884e00;
+  --color-on-primary: #ffffff;
+  --color-primary-container: #ab6300;
+  --color-on-primary-container: #fffbff;
+  --color-primary-fixed: #ffdcbf;
+  --color-primary-fixed-dim: #ffb873;
+  --color-on-primary-fixed: #2d1600;
+  --color-on-primary-fixed-variant: #6a3b00;
+  --color-inverse-primary: #ffb873;
+  --color-secondary: #305ab4;
+  --color-on-secondary: #ffffff;
+  --color-secondary-container: #7ba0ff;
+  --color-on-secondary-container: #003484;
+  --color-secondary-fixed: #dae2ff;
+  --color-secondary-fixed-dim: #b1c5ff;
+  --color-on-secondary-fixed: #001847;
+  --color-on-secondary-fixed-variant: #0b419b;
+  --color-tertiary: #b51c12;
+  --color-on-tertiary: #ffffff;
+  --color-tertiary-container: #d83829;
+  --color-on-tertiary-container: #fffbff;
+  --color-tertiary-fixed: #ffdad5;
+  --color-tertiary-fixed-dim: #ffb4a8;
+  --color-on-tertiary-fixed: #410000;
+  --color-on-tertiary-fixed-variant: #930001;
+  --color-error: #ba1a1a;
+  --color-on-error: #ffffff;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+  --color-background: #f8f5f0;
+  --color-on-background: #292524;
+  --color-surface-variant: #e3e2df;
+
+  --font-headline-lg: "Plus Jakarta Sans", sans-serif;
+  --font-headline-md: "Plus Jakarta Sans", sans-serif;
+  --font-headline-sm: "Plus Jakarta Sans", sans-serif;
+  --font-display-lg: "Plus Jakarta Sans", sans-serif;
+  --font-display-lg-mobile: "Plus Jakarta Sans", sans-serif;
+  --font-label-lg: "Plus Jakarta Sans", sans-serif;
+  --font-label-md: "Plus Jakarta Sans", sans-serif;
+  --font-label-sm: "Plus Jakarta Sans", sans-serif;
+  --font-body-lg: "Inter", sans-serif;
+  --font-body-md: "Inter", sans-serif;
+  --font-body-sm: "Inter", sans-serif;
+
+  --spacing-space-xs: 0.25rem;
+  --spacing-space-sm: 0.5rem;
+  --spacing-space-md: 1rem;
+  --spacing-space-lg: 1.5rem;
+  --spacing-space-xl: 2.5rem;
+  --spacing-gutter: 1.5rem;
+  --spacing-margin: 2rem;
+}
+
+body {
+  font-family: var(--font-body-md);
+  color: var(--color-on-surface);
+  background-color: var(--color-surface);
+}
+
+.font-headline-lg {
+  font-family: var(--font-headline-lg);
+  font-size: 28px;
+  line-height: 36px;
+  font-weight: 600;
+}
+
+.font-headline-lg-mobile {
+  font-family: var(--font-display-lg-mobile);
+  font-size: 26px;
+  line-height: 34px;
+  font-weight: 600;
+}
+
+.font-headline-md {
+  font-family: var(--font-headline-md);
+  font-size: 22px;
+  line-height: 30px;
+  font-weight: 600;
+}
+
+.font-headline-sm {
+  font-family: var(--font-headline-sm);
+  font-size: 18px;
+  line-height: 26px;
+  font-weight: 600;
+}
+
+.font-body-lg {
+  font-family: var(--font-body-lg);
+  font-size: 17px;
+  line-height: 28px;
+  font-weight: 400;
+}
+
+.font-body-md {
+  font-family: var(--font-body-md);
+  font-size: 15px;
+  line-height: 24px;
+  font-weight: 400;
+}
+
+.font-body-sm {
+  font-family: var(--font-body-sm);
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 400;
+}
+
+.font-label-lg {
+  font-family: var(--font-label-lg);
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+
+.font-label-md {
+  font-family: var(--font-label-md);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+}
+
+.font-label-sm {
+  font-family: var(--font-label-sm);
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 600;
+}
+
+/* Material symbol styling helper */
+.material-symbols-outlined {
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  vertical-align: middle;
+  line-height: 1;
+}
+
+.material-symbols-outlined.fill-1 {
+  font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+
+/* Hide scrollbar for clean aesthetics */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
