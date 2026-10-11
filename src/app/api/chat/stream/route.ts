@@ -5,10 +5,14 @@ import {
   GROOVEYY_SYSTEM_INSTRUCTION,
   PRIMARY_MODEL,
   FALLBACK_MODELS,
+  getErrorStatus,
   isTransientError,
   isPermanentError,
+  isQuotaExhausted,
   getUserFriendlyErrorMessage,
   sleep,
+  computeBackoffMs,
+  shouldRetrySameModel,
   recordActiveProviderStatus,
   streamFreeFallbackProvider,
 } from '@/src/lib/gemini';
@@ -56,9 +60,7 @@ export async function POST(req: NextRequest) {
         let lastError: any = null;
 
         for (const model of modelsToTry) {
-          const maxRetries = 2; // 1 initial attempt + 1 retry for transient errors
-
-          for (let attempt = 0; attempt < maxRetries; attempt++) {
+          for (let attempt = 0; attempt < 3; attempt++) {
             try {
               const responseStream = await ai.models.generateContentStream({
                 model,
@@ -96,8 +98,10 @@ export async function POST(req: NextRequest) {
                 return;
               }
 
-              // Permanent errors: fail immediately without retry or fallback
-              if (isPermanentError(err)) {
+              const status = getErrorStatus(err);
+
+              // Auth/parameter errors are key-level: no other model will help.
+              if (status === 401 || status === 403 || status === 400) {
                 recordActiveProviderStatus('gemini', model, false, 'Authentication error');
                 const friendlyMsg = getUserFriendlyErrorMessage(err);
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: friendlyMsg })}\n\n`));
@@ -106,22 +110,25 @@ export async function POST(req: NextRequest) {
                 return;
               }
 
-              // 404 (model not supported/found): advance immediately to next fallback model
-              const status = Number(err?.status || err?.code);
+              // 404: this model is unavailable for this key — move on immediately.
               if (status === 404) {
                 break;
               }
 
-              // Transient error with retry attempts remaining: wait exponential backoff with jitter
-              if (isTransientError(err) && attempt < maxRetries - 1) {
-                const delay = 500 * Math.pow(2, attempt) + Math.random() * 200;
-                await sleep(delay);
+              // Transient error with retries remaining: bounded exponential backoff
+              // with jitter, honouring Retry-After when the server supplies one.
+              if (shouldRetrySameModel(err, attempt)) {
+                const delay = computeBackoffMs(attempt, err);
+                if (delay > 0) await sleep(delay);
                 continue;
               }
 
-              // Transient error with retries exhausted for this model: break to attempt next model
-              if (isTransientError(err)) {
-                console.warn(`[GrooveyAI] Model ${model} unavailable (status ${err?.status || 503}). Falling back...`);
+              // Exhausted retries, or a long-horizon quota block on this model:
+              // fail over to the next model instead of retrying in place.
+              if (isTransientError(err) || isQuotaExhausted(err)) {
+                console.warn(
+                  `[GrooveyAI] Model ${model} unavailable (status ${status || 'n/a'}). Trying next model...`
+                );
                 break;
               }
 
@@ -131,8 +138,9 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // If all Gemini models failed before any chunk was sent, attempt secondary free fallback provider (Groq / OpenRouter) if configured
-        if (chunksSent === 0 && isTransientError(lastError)) {
+        // If all Gemini models failed before any chunk was sent, attempt the
+        // secondary free fallback provider (Groq / OpenRouter) if configured.
+        if (chunksSent === 0 && (isTransientError(lastError) || isQuotaExhausted(lastError))) {
           try {
             const fallbackSucceeded = await streamFreeFallbackProvider(
               {

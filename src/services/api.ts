@@ -104,7 +104,12 @@ export async function generateSessionTitle(prompt: string): Promise<string> {
   }
 }
 
-export type HealthStatusType = 'ready' | 'connecting' | 'unavailable' | 'configuration-error';
+export type HealthStatusType =
+  | 'ready'
+  | 'connecting'
+  | 'unavailable'
+  | 'quota-exhausted'
+  | 'configuration-error';
 
 export interface ServerHealth {
   status: HealthStatusType;

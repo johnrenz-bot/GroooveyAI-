@@ -109,8 +109,14 @@ let aiClient: GoogleGenAI | null = null;
 let activeApiKey: string | null = null;
 
 export const PRIMARY_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+
+// Verified model fallback chain.
+// - gemini-3.7-flash / gemini-3.5-flash: same Flash-3.x quota pool as the primary
+//   (they 429 together when the daily free-tier quota is exhausted).
+// - gemini-3.1-flash-lite: a distinct, lighter model that succeeds even while the
+//   primary Flash-3.x quota is exhausted, so it is the effective rescue path.
 export const FALLBACK_MODELS = [
-  'gemini-3.7-flash',
+  'gemini-3.1-flash-lite',
   'gemini-3.5-flash',
   'gemini-3-flash-preview',
 ];
@@ -146,12 +152,102 @@ export function getGeminiClient(): GoogleGenAI {
 }
 
 /**
- * Checks if an error is transient (e.g. 503 high demand / service unavailable, 429 rate limit, 500, socket resets)
+ * Extracts an HTTP status code from a Google GenAI ApiError (or a generic error).
+ */
+export function getErrorStatus(err: any): number | undefined {
+  if (!err) return undefined;
+  const direct = Number(err.status || err.code || err.statusCode);
+  if (Number.isFinite(direct) && direct > 0) return direct;
+  // Some SDK paths only expose the status inside a JSON-encoded message body.
+  try {
+    const raw = typeof err.message === 'string' ? err.message : '';
+    const match = raw.match(/"code"\s*:\s*(\d{3})/);
+    if (match) return Number(match[1]);
+  } catch {
+    /* ignore */
+  }
+  return undefined;
+}
+
+/**
+ * Reads the server-supplied retry hint, in milliseconds, if one is present.
+ *
+ * Google signals quota resets in two ways:
+ *  - a standard `Retry-After` header (seconds), and/or
+ *  - a `"Please retry in 20h47m55.6s."` sentence inside the error message.
+ *
+ * We parse both so we can honour the server's own recovery window instead of
+ * guessing, and so a daily-quota block is never mistaken for a 503 blip.
+ */
+export function getRetryAfterMs(err: any): number | undefined {
+  if (!err) return undefined;
+
+  const headers = err?.response?.headers;
+  if (headers && typeof headers.get === 'function') {
+    const headerValue = headers.get('retry-after');
+    if (headerValue) {
+      const seconds = Number(headerValue);
+      if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+      const asDate = Date.parse(headerValue);
+      if (!Number.isNaN(asDate)) return Math.max(0, asDate - Date.now());
+    }
+  }
+
+  // e.g. "Please retry in 20h47m55.665684242s."
+  const raw = typeof err.message === 'string' ? err.message : '';
+  const match = raw.match(/retry in\s+((?:\d+h)?(?:\d+m)?(?:\d+(?:\.\d+)?)s)/i);
+  if (match) {
+    const parts = match[1];
+    let ms = 0;
+    const hours = parts.match(/(\d+(?:\.\d+)?)h/);
+    const mins = parts.match(/(\d+(?:\.\d+)?)m/);
+    const secs = parts.match(/(\d+(?:\.\d+)?)s/);
+    if (hours) ms += Number(hours[1]) * 3_600_000;
+    if (mins) ms += Number(mins[1]) * 60_000;
+    if (secs) ms += Number(secs[1]) * 1000;
+    if (ms > 0) return Math.round(ms);
+  }
+  return undefined;
+}
+
+/**
+ * True when the error is a rate/quota block that resolves only after a long,
+ * server-declared window (e.g. the free-tier daily request quota).
+ *
+ * This is materially different from a 503 "high demand" spike: retrying in a few
+ * seconds cannot succeed, so callers must surface an accurate message instead of
+ * reporting the provider as temporarily overloaded.
+ */
+export function isQuotaExhausted(err: any): boolean {
+  const status = getErrorStatus(err);
+  const raw = typeof err?.message === 'string' ? err.message : '';
+  const lowerMsg = raw.toLowerCase();
+
+  if (status === 429) {
+    if (lowerMsg.includes('exceeded your current quota') || lowerMsg.includes('quota exceeded')) {
+      return true;
+    }
+    // A per-minute rate limit is short-lived and still worth retrying with backoff.
+    const retryAfterMs = getRetryAfterMs(err);
+    if (lowerMsg.includes('rate limit') || lowerMsg.includes('resource_exhausted')) {
+      return retryAfterMs !== undefined && retryAfterMs > 60_000;
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks if an error is transient (503 high demand / service unavailable, short
+ * rate limits, 5xx, socket resets). Excludes long-horizon quota exhaustion, which
+ * is handled separately by isQuotaExhausted().
  */
 export function isTransientError(err: any): boolean {
   if (!err) return false;
-  const status = Number(err.status || err.code || err.statusCode);
-  if (status === 503 || status === 429 || status === 500 || status === 502 || status === 504) {
+
+  if (isQuotaExhausted(err)) return false;
+
+  const status = getErrorStatus(err);
+  if (status !== undefined && (status === 503 || status === 429 || status === 500 || status === 502 || status === 504)) {
     return true;
   }
   const message = typeof err.message === 'string' ? err.message : '';
@@ -172,12 +268,14 @@ export function isTransientError(err: any): boolean {
 }
 
 /**
- * Checks if an error is permanent (e.g. 401 unauthenticated, 400 invalid argument, 403 forbidden)
+ * Checks if an error is permanent (e.g. 401 unauthenticated, 400 invalid argument,
+ * 403 forbidden, or 404 — a model id that does not exist / is no longer available).
+ * Retrying a permanent error can never succeed, so callers must fail fast.
  */
 export function isPermanentError(err: any): boolean {
   if (!err) return false;
-  const status = Number(err.status || err.code || err.statusCode);
-  if (status === 400 || status === 401 || status === 403) {
+  const status = getErrorStatus(err);
+  if (status === 400 || status === 401 || status === 403 || status === 404) {
     return true;
   }
   const message = typeof err.message === 'string' ? err.message : '';
@@ -188,24 +286,48 @@ export function isPermanentError(err: any): boolean {
     lowerMsg.includes('unauthenticated') ||
     lowerMsg.includes('permission_denied') ||
     lowerMsg.includes('api_key_invalid') ||
-    lowerMsg.includes('invalid_argument')
+    lowerMsg.includes('invalid_argument') ||
+    lowerMsg.includes('not_found') ||
+    lowerMsg.includes('no longer available')
   );
 }
 
 /**
- * Formats a clean, user-friendly error message, strictly concealing API keys and credentials.
+ * Formats a clean, user-friendly error message, strictly concealing API keys and
+ * credentials, and distinguishing an exhausted quota from a temporary 503 spike.
  */
 export function getUserFriendlyErrorMessage(err: any): string {
   if (!err) return 'An unexpected error occurred. Please try again.';
 
+  // A long-horizon quota block is NOT a transient high-demand condition; telling
+  // the user to "retry in a few moments" would be misleading.
+  if (isQuotaExhausted(err)) {
+    const retryAfterMs = getRetryAfterMs(err);
+    if (retryAfterMs && retryAfterMs > 60_000) {
+      const hours = retryAfterMs / 3_600_000;
+      const resetHint =
+        hours >= 1
+          ? `try again in about ${Math.ceil(hours)} hour${Math.ceil(hours) > 1 ? 's' : ''}.`
+          : `try again in about ${Math.ceil(retryAfterMs / 60_000)} minute(s).`;
+      return `The AI coaching service has reached its free-tier request quota for today. Please ${resetHint}`;
+    }
+    return 'The AI coaching service has reached its request quota. Please try again later.';
+  }
+
   if (isTransientError(err)) {
-    return 'The AI coaching service is currently experiencing high demand. Please try again in a few moments.';
+    return 'The AI coaching service is temporarily at capacity. Retrying automatically — please send your message again in a few moments.';
+  }
+
+  const status = getErrorStatus(err);
+  if (status === 404) {
+    return 'The configured AI model is unavailable for this API key. Please verify the model configuration.';
   }
 
   const raw = err?.message || String(err);
   try {
     const parsed = JSON.parse(raw);
     if (parsed.error?.message) {
+      // The provider's own message is already credential-free; keep it readable.
       return parsed.error.message;
     }
   } catch {
@@ -445,7 +567,7 @@ export async function generateFreeFallbackProvider(params: {
 
 // In-memory status probe cache to avoid flooding the API while delivering truthful status
 interface CachedHealth {
-  status: 'ready' | 'connecting' | 'unavailable' | 'configuration-error';
+  status: 'ready' | 'connecting' | 'unavailable' | 'quota-exhausted' | 'configuration-error';
   provider: string;
   model: string;
   activeProvider: 'gemini' | 'groq' | 'openrouter' | 'none';
@@ -509,10 +631,10 @@ export async function checkTruthfulHealth(forceFresh = false): Promise<CachedHea
     };
     return healthCache;
   } catch (err: any) {
-    const status = Number(err?.status || err?.code);
+    const status = getErrorStatus(err);
 
     // Authentication failure
-    if (status === 401 || String(err?.message).includes('401') || String(err?.message).includes('UNAUTHENTICATED')) {
+    if (status === 401 || status === 403 || String(err?.message).includes('UNAUTHENTICATED')) {
       healthCache = {
         status: 'configuration-error',
         provider: 'Google Gemini',
@@ -528,61 +650,113 @@ export async function checkTruthfulHealth(forceFresh = false): Promise<CachedHea
       return healthCache;
     }
 
-    // High demand (503) or rate limit (429) -> check if fallback model works
-    if (isTransientError(err)) {
-      try {
-        const ai = getGeminiClient();
-        await ai.models.generateContent({
-          model: FALLBACK_MODELS[0],
-          contents: 'ping',
-          config: { maxOutputTokens: 1 },
-        });
+    // A confirmed model id that does not exist / is retired for this key.
+    if (status === 404) {
+      healthCache = {
+        status: 'configuration-error',
+        provider: 'Google Gemini',
+        model: PRIMARY_MODEL,
+        activeProvider: 'none',
+        message: `Model "${PRIMARY_MODEL}" is not available for this API key (404 NOT_FOUND).`,
+        hasKey: true,
+        fallbackModels: FALLBACK_MODELS,
+        secondaryFallbackAvailable: hasSecondary,
+        freeTierNote: 'Set GEMINI_MODEL to a model your key can access.',
+        checkedAt: now,
+      };
+      return healthCache;
+    }
 
-        healthCache = {
-          status: 'ready',
-          provider: 'Google Gemini (Fallback Active)',
-          model: FALLBACK_MODELS[0],
-          activeProvider: 'gemini',
-          message: `High demand on ${PRIMARY_MODEL} (503). Automatic fallback to ${FALLBACK_MODELS[0]} is active.`,
-          hasKey: true,
-          fallbackModels: FALLBACK_MODELS,
-          secondaryFallbackAvailable: hasSecondary,
-          freeTierNote: 'Gemini Developer API Free Tier: 15 RPM / 1M TPM.',
-          checkedAt: now,
-        };
-        return healthCache;
-      } catch (fbErr: any) {
-        // If secondary free fallback (Groq) is configured, report ready via secondary
-        if (groqKey) {
+    // Capacity saturation or a short rate limit: probe the whole fallback chain,
+    // not just the first entry, before declaring the service down.
+    if (isTransientError(err) || isQuotaExhausted(err)) {
+      const ai = getGeminiClient();
+      for (const fbModel of FALLBACK_MODELS) {
+        try {
+          await ai.models.generateContent({
+            model: fbModel,
+            contents: 'ping',
+            config: { maxOutputTokens: 1 },
+          });
+
+          const viaQuota = isQuotaExhausted(err);
           healthCache = {
             status: 'ready',
-            provider: 'Groq Cloud (Free Tier Fallback)',
-            model: 'llama-3.3-70b-versatile',
-            activeProvider: 'groq',
-            message: 'Gemini busy (503). Active free-tier fallback to Groq LLaMA 3.3 70B.',
+            provider: 'Google Gemini (Fallback Active)',
+            model: fbModel,
+            activeProvider: 'gemini',
+            message: viaQuota
+              ? `Free-tier quota exhausted on ${PRIMARY_MODEL}. Serving via ${fbModel}.`
+              : `High demand on ${PRIMARY_MODEL}. Serving via ${fbModel}.`,
             hasKey: true,
             fallbackModels: FALLBACK_MODELS,
-            secondaryFallbackAvailable: true,
-            freeTierNote: 'Groq Free Tier: 14,400 RPD / 100k TPM.',
+            secondaryFallbackAvailable: hasSecondary,
+            freeTierNote: viaQuota
+              ? 'Automatic model failover is active.'
+              : 'Transient high-demand spike. Automatic backoff retries are active.',
             checkedAt: now,
           };
           return healthCache;
+        } catch {
+          // Try the next candidate model.
         }
+      }
 
+      // Optional secondary free fallback (Groq) if configured.
+      if (groqKey) {
         healthCache = {
-          status: 'unavailable',
-          provider: 'Google Gemini',
-          model: PRIMARY_MODEL,
-          activeProvider: 'none',
-          message: 'The AI service is temporarily experiencing high demand (503). Retrying automatically.',
+          status: 'ready',
+          provider: 'Groq Cloud (Free Tier Fallback)',
+          model: 'llama-3.3-70b-versatile',
+          activeProvider: 'groq',
+          message: 'Gemini unavailable. Active free-tier fallback to Groq LLaMA 3.3 70B.',
           hasKey: true,
           fallbackModels: FALLBACK_MODELS,
-          secondaryFallbackAvailable: hasSecondary,
-          freeTierNote: 'Transient high-demand spike. Automatic backoff retries are active.',
+          secondaryFallbackAvailable: true,
+          freeTierNote: 'Groq free tier is serving coaching requests.',
           checkedAt: now,
         };
         return healthCache;
       }
+
+      // Distinguish an exhausted quota from a temporary spike — the two need very
+      // different user actions, and conflating them is what produced the
+      // misleading "503 High Demand" report.
+      if (isQuotaExhausted(err)) {
+        const retryAfterMs = getRetryAfterMs(err);
+        const resetText =
+          retryAfterMs && retryAfterMs > 3_600_000
+            ? ` Quota resets in about ${Math.ceil(retryAfterMs / 3_600_000)} hour(s).`
+            : '';
+        healthCache = {
+          status: 'quota-exhausted',
+          provider: 'Google Gemini',
+          model: PRIMARY_MODEL,
+          activeProvider: 'none',
+          message: `Free-tier request quota exhausted for ${PRIMARY_MODEL}.${resetText}`,
+          hasKey: true,
+          fallbackModels: FALLBACK_MODELS,
+          secondaryFallbackAvailable: hasSecondary,
+          freeTierNote:
+            'All configured Gemini models share the exhausted quota. Upgrade the API key tier or add a fallback provider key.',
+          checkedAt: now,
+        };
+        return healthCache;
+      }
+
+      healthCache = {
+        status: 'unavailable',
+        provider: 'Google Gemini',
+        model: PRIMARY_MODEL,
+        activeProvider: 'none',
+        message: 'The AI service is temporarily at capacity (503). Retrying automatically.',
+        hasKey: true,
+        fallbackModels: FALLBACK_MODELS,
+        secondaryFallbackAvailable: hasSecondary,
+        freeTierNote: 'Transient high-demand spike. Automatic backoff retries are active.',
+        checkedAt: now,
+      };
+      return healthCache;
     }
 
     healthCache = {
@@ -616,11 +790,13 @@ export function recordActiveProviderStatus(
     provider: provider === 'groq' ? 'Groq Cloud' : provider === 'openrouter' ? 'OpenRouter' : 'Google Gemini',
     model,
     activeProvider: isHealthy ? provider : 'none',
-    message: message || (isHealthy ? 'Connected and ready' : 'High demand (503)'),
+    message: message || (isHealthy ? 'Connected and ready' : 'Provider temporarily unavailable'),
     hasKey: Boolean(getGeminiApiKey()),
     fallbackModels: FALLBACK_MODELS,
     secondaryFallbackAvailable: hasSecondary,
-    freeTierNote: 'Free tier coaching mode active.',
+    freeTierNote: isHealthy
+      ? 'Free tier coaching mode active.'
+      : 'Automatic retry and model failover are active.',
     checkedAt: Date.now(),
   };
 }
@@ -628,6 +804,45 @@ export function recordActiveProviderStatus(
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** Hard ceiling on any single backoff wait, so a request can never hang. */
+const MAX_BACKOFF_MS = 8_000;
+/** Hard ceiling on the number of retries per model, preventing infinite loops. */
+const MAX_ATTEMPTS_PER_MODEL = 3;
+
+/**
+ * Computes a bounded exponential-backoff delay with full jitter.
+ *
+ * `attempt` is zero-based. The result is capped at MAX_BACKOFF_MS and is always
+ * strictly positive, so callers never busy-loop. A server-supplied Retry-After is
+ * honoured only when it is short enough to be worth waiting out inline; anything
+ * longer (e.g. a daily quota reset) is deliberately not slept on.
+ */
+export function computeBackoffMs(
+  attempt: number,
+  err?: any
+): number {
+  const serverHint = getRetryAfterMs(err);
+  if (serverHint !== undefined) {
+    // Respect the server's window when it is a short, waitable pause.
+    if (serverHint > 0 && serverHint <= MAX_BACKOFF_MS) return serverHint;
+    // Long horizon (quota reset) -> fail over rather than block the user.
+    if (serverHint > MAX_BACKOFF_MS) return 0;
+  }
+  const exponential = Math.min(MAX_BACKOFF_MS, 500 * Math.pow(2, Math.max(0, attempt)));
+  const jitter = Math.random() * exponential * 0.5;
+  return Math.max(250, Math.min(MAX_BACKOFF_MS, Math.round(exponential - exponential * 0.5 + jitter)));
+}
+
+/** True when another attempt on the same model could plausibly succeed. */
+export function shouldRetrySameModel(err: any, attempt: number): boolean {
+  if (attempt >= MAX_ATTEMPTS_PER_MODEL - 1) return false;
+  // Never retry a permanent failure or a long-horizon quota block on this model.
+  if (isPermanentError(err) || isQuotaExhausted(err)) return false;
+  return isTransientError(err);
+}
+
+export { MAX_ATTEMPTS_PER_MODEL, MAX_BACKOFF_MS };
 
 export interface GenerateContentParams {
   contents: any;
@@ -647,8 +862,7 @@ export async function generateContentWithFallbackAndRetry(
   let lastError: any = null;
 
   for (const model of models) {
-    const maxRetries = 2; // 1 initial attempt + 1 retry for transient errors
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
+    for (let attempt = 0; attempt < MAX_ATTEMPTS_PER_MODEL; attempt++) {
       try {
         const response = await ai.models.generateContent({
           model,
@@ -660,37 +874,38 @@ export async function generateContentWithFallbackAndRetry(
       } catch (err: any) {
         lastError = err;
 
-        // Permanent errors (401, 400, 403): throw immediately
-        if (isPermanentError(err)) {
+        // Authentication / parameter errors apply to the key, not the model:
+        // retrying any other model would fail identically.
+        const status = getErrorStatus(err);
+        if (status === 401 || status === 403 || status === 400) {
           recordActiveProviderStatus('gemini', model, false, 'Authentication or parameter error');
           throw err;
         }
 
-        // 404 (model not found): advance to next fallback model immediately
-        const status = Number(err?.status || err?.code);
+        // 404: this specific model is unavailable — advance immediately without
+        // burning retry budget on a model that can never serve this key.
         if (status === 404) {
           break;
         }
 
-        // Transient error with retries remaining: exponential backoff with jitter
-        if (isTransientError(err) && attempt < maxRetries - 1) {
-          const delay = 500 * Math.pow(2, attempt) + Math.random() * 200;
-          await sleep(delay);
+        // Transient capacity/rate-limit error with retries remaining:
+        // bounded exponential backoff with jitter, honouring Retry-After.
+        if (shouldRetrySameModel(err, attempt)) {
+          const delay = computeBackoffMs(attempt, err);
+          if (delay > 0) await sleep(delay);
           continue;
         }
 
-        // Transient error with retries exhausted: break to next model
-        if (isTransientError(err)) {
-          break;
-        }
-
+        // Exhausted retries, or a long-horizon quota block on this model.
         break;
       }
     }
   }
 
-  // If all Gemini models encountered transient failures, attempt secondary free fallback provider if configured
-  if (params.messagesForFallback && isTransientError(lastError)) {
+  // If every Gemini model failed for a retryable reason, try the optional
+  // secondary free-tier provider (Groq / OpenRouter) if one is configured.
+  const retryableOverall = isTransientError(lastError) || isQuotaExhausted(lastError);
+  if (params.messagesForFallback && retryableOverall) {
     const fallbackText = await generateFreeFallbackProvider({
       messages: params.messagesForFallback,
       systemInstruction: params.config?.systemInstruction || GROOVEYY_SYSTEM_INSTRUCTION,
@@ -702,6 +917,6 @@ export async function generateContentWithFallbackAndRetry(
     }
   }
 
-  recordActiveProviderStatus('gemini', PRIMARY_MODEL, false, 'All configured models temporarily unavailable');
-  throw lastError || new Error('All configured models are temporarily unavailable.');
+  recordActiveProviderStatus('gemini', PRIMARY_MODEL, false, 'All configured models unavailable');
+  throw lastError || new Error('All configured models are unavailable.');
 }

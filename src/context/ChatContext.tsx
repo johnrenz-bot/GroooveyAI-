@@ -258,7 +258,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     activeProvider: 'gemini',
     message: 'Connecting to AI Coach...',
     hasKey: true,
-    fallbackModels: ['gemini-3.7-flash', 'gemini-3.5-flash'],
+    fallbackModels: ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3-flash-preview'],
     secondaryFallbackAvailable: false,
     freeTierNote: 'Gemini Developer API Free Tier',
     checkedAt: Date.now(),

@@ -103,7 +103,7 @@ All technologies below are confirmed by `package.json`, `package-lock.json`, and
 ### AI Integration
 - **Primary SDK:** `@google/genai` `^2.4.0` (Google Gemini Developer API)
 - **Primary model:** `gemini-3.8-flash` (override via `GEMINI_MODEL`)
-- **Gemini fallbacks:** `gemini-3.7-flash`, `gemini-3.5-flash`, `gemini-3-flash-preview`
+- **Gemini fallbacks (in order):** `gemini-3.1-flash-lite`, `gemini-3.5-flash`, `gemini-3-flash-preview`. The primary and the Flash-3.x fallbacks share one free-tier request quota, so `gemini-3.1-flash-lite` leads the chain as a separate quota pool that can serve traffic when the primary is exhausted.
 - **Optional free-tier fallbacks:** Groq (`llama-3.3-70b-versatile`) and OpenRouter (`meta-llama/llama-3.3-70b-instruct:free`), called directly over HTTPS
 
 ### Persistence
@@ -355,8 +355,10 @@ services/api.ts reads the stream → ChatContext accumulates chunks → UI rende
 
 ### Resilience model
 
-- **Transient errors** (`429`, `500`, `502`, `503`, `504`, timeouts) → retry with exponential backoff + jitter, then advance to the next model, then optionally to Groq/OpenRouter.
+- **Transient capacity errors** (`503`, `500`, `502`, `504`, timeouts, short `429` rate limits) → bounded exponential backoff with jitter (max 3 attempts per model, each wait capped), honouring `Retry-After` when the server supplies a short one, then advance to the next model, then optionally to Groq/OpenRouter.
+- **Quota exhaustion** (`429` with a long, server-declared reset window, e.g. the free-tier daily request limit) → not retried in place, because retrying cannot succeed until the quota resets. The app fails over to another model/pool and surfaces the reset time.
 - **Permanent errors** (`400`, `401`, `403`) → fail immediately with a clear message (e.g., invalid API key).
+- **Unknown/unavailable models** (`404`) → skipped and the chain advances to the next model.
 - **Partial streams** are never silently restarted (which would duplicate output); the client is told to resend.
 - **Health** is computed by actually pinging the model (cached in memory for 60s) so the UI never falsely reports readiness.
 
@@ -468,19 +470,19 @@ If the API key is missing, the endpoint degrades gracefully by returning a trunc
 ```json
 {
   "status": "ready",
-  "provider": "Google Gemini",
-  "model": "gemini-3.8-flash",
+  "provider": "Google Gemini (Fallback Active)",
+  "model": "gemini-3.1-flash-lite",
   "activeProvider": "gemini",
-  "message": "Connected and ready for rehearsals",
+  "message": "Free-tier quota exhausted on gemini-3.8-flash. Serving via gemini-3.1-flash-lite.",
   "hasKey": true,
-  "fallbackModels": ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-3-flash-preview"],
+  "fallbackModels": ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview"],
   "secondaryFallbackAvailable": false,
-  "freeTierNote": "Gemini Developer API Free Tier: 15 RPM / 1M TPM.",
+  "freeTierNote": "Automatic model failover is active.",
   "checkedAt": 1730000000000
 }
 ```
 
-`status` is one of `ready | connecting | unavailable | configuration-error`. The value reflects a real probe of the model, so it is trustworthy.
+`status` is one of `ready | connecting | unavailable | quota-exhausted | configuration-error`. The value reflects a real probe of the model, so it is trustworthy. `quota-exhausted` means the provider's free-tier request quota is spent and only resets after the window reported in `message` — retrying sooner will not help, and the remedy is to use a different key tier or configure a fallback provider.
 
 ---
 
@@ -505,8 +507,11 @@ Create `.env.local` in the project root and set `GEMINI_API_KEY`, then restart t
 **`401 UNAUTHENTICATED` / `API key not valid`**
 The key is invalid or revoked. Generate a new key and replace the old one. Do not wrap the key in quotes-with-`Bearer`; the app strips an accidental `Bearer ` prefix but a malformed key will still fail.
 
-**"The AI coaching service is currently experiencing high demand"**
-The primary model is at capacity (429/503). The app retries with backoff and falls back to other Gemini models automatically. Optionally set `GROQ_API_KEY` or `OPENROUTER_API_KEY` for an additional free-tier fallback.
+**"The AI coaching service is temporarily at capacity"**
+The model is at capacity (503) or briefly rate-limited. The app retries with bounded backoff and falls back to other Gemini models automatically. Optionally set `GROQ_API_KEY` or `OPENROUTER_API_KEY` for an additional free-tier fallback.
+
+**"The AI coaching service has reached its free-tier request quota for today" / header shows "Quota Reached"**
+This is **not** a temporary outage: the Google Gemini free tier limits requests per day, and that limit has been used up. Retrying sooner will not help — the app reports the reset window returned by Google. To restore service immediately, either enable billing on the Google AI project (raises the limit), use a different API key, or set `GROQ_API_KEY` / `OPENROUTER_API_KEY` so a non-Gemini provider can serve requests. Check current usage at [ai.dev/rate-limit](https://ai.dev/rate-limit).
 
 **Port 3000 already in use**
 Run on a different port: `npm run dev -- -p 3001`, or set the `PORT` environment variable.

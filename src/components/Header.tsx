@@ -56,8 +56,15 @@ export const Header: React.FC = () => {
       case 'unavailable':
         return {
           dotClass: 'bg-amber-700',
-          badgeText: 'High Demand (503)',
+          badgeText: 'Temporarily Unavailable',
           label: 'Retrying',
+          borderClass: 'border-amber-300 bg-amber-50 text-[#92400e]',
+        };
+      case 'quota-exhausted':
+        return {
+          dotClass: 'bg-amber-800',
+          badgeText: 'Quota Reached',
+          label: 'Quota Limit',
           borderClass: 'border-amber-300 bg-amber-50 text-[#92400e]',
         };
       case 'configuration-error':
